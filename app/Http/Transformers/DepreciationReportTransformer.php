@@ -5,12 +5,14 @@ namespace App\Http\Transformers;
 use App\Helpers\Helper;
 use App\Models\Asset;
 use App\Models\Setting;
+use Carbon\Carbon;
 use Illuminate\Database\Eloquent\Collection;
+use Illuminate\Http\Request;
 
 /**
- *  This tranformer looks like it's extraneous, since we return as much or more
+ * This transformer looks like it's extraneous, since we return as much or more
  * info in the AssetsTransformer, but we want to flatten these results out so that they
- * don't dislose more information than we want. Folks with depreciation powers don't necessaily
+ * don't disclose more information than we want. Folks with depreciation powers don't necessarily
  * have the right to see additional info, and inspecting the API call here could disclose
  * info they're not supposed to see.
  *
@@ -20,19 +22,43 @@ use Illuminate\Database\Eloquent\Collection;
  */
 class DepreciationReportTransformer
 {
-    public function transformAssets(Collection $assets, $total)
+
+    public function transformAssets(Collection $assets, $total, ?Request $request = null) 
     {
         $array = [];
+
+        /*
+         * Determine the date the depreciation report should be
+         * calculated against.
+         *
+         * If no date was supplied, use today's date. This preserves
+         * the existing Snipe-IT behavior.
+         */
+        $asOfDate = Carbon::today();
+
+        if ($request && $request->filled('depreciation_date')) {
+            try {
+                $asOfDate = Carbon::createFromFormat(
+                    'Y-m-d',
+                    $request->input('depreciation_date')
+                )->startOfDay();
+            } catch (\Exception $e) {
+                /*
+                 * If an invalid date was supplied, fall back to today.
+                 */
+                $asOfDate = Carbon::today();
+            }
+        }
+
         foreach ($assets as $asset) {
-            $array[] = self::transformAsset($asset);
+            $array[] = self::transformAsset($asset, $asOfDate);
         }
 
         return (new DatatablesTransformer)->transformDatatables($array, $total);
     }
 
-    public function transformAsset(Asset $asset)
+    public function transformAsset(Asset $asset, ?Carbon $asOfDate = null) 
     {
-
         /**
          * Set some default values here
          */
@@ -41,6 +67,11 @@ class DepreciationReportTransformer
         $monthly_depreciation = null;
         $diff = null;
         $checkout_target = null;
+
+        /**
+         * If no date was supplied, use today.
+         */
+        $asOfDate = $asOfDate ?: Carbon::today();
 
         /**
          * If there is a location set and a currency set, use that for display
@@ -53,7 +84,7 @@ class DepreciationReportTransformer
 
         /**
          * If there is a NOT an empty purchase cost (meaning not null or '' but it *could* be zero),
-         * format the purchase cost. We coould do this inline in the transformer, but we need that value
+         * format the purchase cost. We could do this inline in the transformer, but we need that value
          * for the other calculations that come after, like diff, etc.
          */
         if ($asset->purchase_cost != '') {
@@ -63,10 +94,26 @@ class DepreciationReportTransformer
         /**
          * Override the previously set null values if there is a valid model and associated depreciation
          */
-        if (($asset->model) && ($asset->model->depreciation) && ($asset->model->depreciation->months !== 0)) {
-            $depreciated_value = Helper::formatCurrencyOutput($asset->getDepreciatedValue());
+        if (($asset->model) && ($asset->model->depreciation) && ($asset->model->depreciation->months !== 0)) 
+        {
+            /*
+             * Calculate the book value using the selected report date.
+             */
+            $depreciated_value_raw = $asset->getDepreciatedValue($asOfDate);
+            $depreciated_value = Helper::formatCurrencyOutput($depreciated_value_raw);
+
+            /*
+             * Monthly depreciation remains the normal monthly depreciation
+             * amount configured for the asset.
+             */
             $monthly_depreciation = Helper::formatCurrencyOutput($asset->getMonthlyDepreciation());
-            $diff = Helper::formatCurrencyOutput(($asset->purchase_cost - $asset->getDepreciatedValue()));
+
+            /*
+             * Difference between purchase cost and book value as of
+             * the selected report date.
+             */
+            $diff = Helper::formatCurrencyOutput($asset->purchase_cost - $depreciated_value_raw);
+
         } elseif ($asset->model->eol !== null) {
             $monthly_depreciation = Helper::formatCurrencyOutput(($asset->model->eol > 0 ? ($asset->purchase_cost / $asset->model->eol) : 0));
         }
@@ -76,11 +123,9 @@ class DepreciationReportTransformer
             if ($asset->checkedOutToUser()) {
                 $checkout_target = $asset->assigned->getFullNameAttribute();
             }
-
         }
 
         $array = [
-
             'company' => ($asset->company) ? e($asset->company->name) : null,
             'name' => e($asset->name),
             'asset_tag' => e($asset->asset_tag),
@@ -106,7 +151,6 @@ class DepreciationReportTransformer
             'diff' => Helper::formatCurrencyOutput($diff),
             'number_of_months' => ($asset->model && $asset->model->depreciation) ? e($asset->model->depreciation->months) : null,
             'depreciation' => (($asset->model) && ($asset->model->depreciation)) ? e($asset->model->depreciation->name) : null,
-
         ];
 
         return $array;
